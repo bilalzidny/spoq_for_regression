@@ -11,7 +11,7 @@ from create_dataset import create_dataset
 
 
 def run_on_custom(plot = True, log_results = True, train_size = 0.8, test_size=0.2, X_train =None, X_test=None, y_train =None, y_test = None,
-                   verbose=True, lambda_range =  np.logspace(-1, 7), w_ref=None, tuning="default", n_trials=200, **kwargs):
+                   verbose=True, lambda_range =  np.logspace(-7, 7), w_ref=None, tuning="default", n_trials=200, **kwargs):
     """
     Generates a custom dataset, trains LASSO, SPOQ, SCAD, and MCO, compares their sparsity recovery
     against a known reference, and computes similarity metrics.
