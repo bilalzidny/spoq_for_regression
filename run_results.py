@@ -12,7 +12,8 @@ from utils.plots import plot_mse_sparsity_table
 # === SETUP LOGGING ===
 os.makedirs("logs", exist_ok=True)
 
-def run_results(file, target_name=None, test_size=0.2, train_size = 0.8, scoring= "aic", lambda_range = np.logspace(-7, 7),
+def run_results(file, target_name=None, test_size=0.2, train_size = 0.8, scoring= "aic", 
+                lambda_range = np.concatenate(([0], np.logspace(-7, 7))),
                 random_state=42, log_results = True, return_results = False, verbose = True, plot = True, 
                 X_train =None, X_test=None, y_train =None, y_test = None):
     """
@@ -219,7 +220,7 @@ def run_results(file, target_name=None, test_size=0.2, train_size = 0.8, scoring
 
 
 def run_results_optuna(file, target_name=None, test_size=0.2, train_size=0.8, scoring="aic",
-                     lambda_range=np.logspace(-1, 6), random_state=42,
+                     lambda_range = np.concatenate(([0], np.logspace(-7, 7))), random_state=42,
                      log_results=True, return_results=False, verbose=True, plot=True,
                      X_train=None, X_test=None, y_train=None, y_test=None, n_trials = 200):
     
