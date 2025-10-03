@@ -128,8 +128,8 @@ def compare_methods(file, target_name, lambda_range=np.logspace(-1, 7), n_runs=1
         "output_path": "data/custom_dataset_spoq.csv",
     }
 
-    # === LIST TO STORE RUN STATISTICS
-    all_stats = []
+    # === DICT TO STORE RUN STATISTICS
+    all_stats = {}
 
     # === SET LOOP RANGE BASED ON SYNTHETIC OR REAL DATASET
     loop_range = range(n_runs) if synthetic else range(1)
@@ -161,7 +161,7 @@ def compare_methods(file, target_name, lambda_range=np.logspace(-1, 7), n_runs=1
             lambda_bounds=(lambda_range.min(), lambda_range.max()),
             X=X, y=y,
             fixed_params={"w_0": w_0_value, "B": 15, "theta": 0.5, "epsilon": 1e-5, "max_iter": 50000},
-            scoring="aic", verbose=False,
+            scoring="aic", verbose=False, n_trials=200
         )
 
         best_params_fista, *_ = tune_model_optuna(
@@ -169,7 +169,7 @@ def compare_methods(file, target_name, lambda_range=np.logspace(-1, 7), n_runs=1
             lambda_bounds=(lambda_range.min(), lambda_range.max()),
             X=X, y=y,
             fixed_params={"w_0": w_0_value, "epsilon": 1e-5, "max_iter": 5000},
-            scoring="aic", verbose=False
+            scoring="aic", verbose=False, n_trials=200
         )
 
         best_params_scad, *_ = tune_model_optuna(
@@ -177,7 +177,7 @@ def compare_methods(file, target_name, lambda_range=np.logspace(-1, 7), n_runs=1
             lambda_bounds=(lambda_range.min(), lambda_range.max()),
             X=X, y=y,
             fixed_params={"w_0": w_0_value, "epsilon": 1e-5, "max_iter": 5000},
-            scoring="aic", verbose=False
+            scoring="aic", verbose=False, n_trials=2
         )
 
         # === FUNCTION TO RUN EACH METHOD AND MEASURE TIME & CONVERGENCE
@@ -198,7 +198,7 @@ def compare_methods(file, target_name, lambda_range=np.logspace(-1, 7), n_runs=1
         time_scad, iters_scad, loss_scad, weights_scad = run_and_time(fista_scad, best_params_scad)
 
         # === STORE RESULTS FOR CURRENT RUN
-        all_stats.append({
+        all_stats[f"run_{i}"] = {
             "time_mco": time_mco_mean,
             "time_spoq": time_spoq,
             "time_lasso": time_lasso,
@@ -206,10 +206,29 @@ def compare_methods(file, target_name, lambda_range=np.logspace(-1, 7), n_runs=1
             "iters_spoq": iters_spoq,
             "iters_lasso": iters_lasso,
             "iters_scad": iters_scad,
-        })
+            "loss_spoq": loss_spoq,
+            "loss_lasso": loss_lasso,
+            "loss_scad": loss_scad,
+            "weights_spoq": weights_spoq, 
+            "weights_lasso": weights_lasso,
+            "weights_scad": weights_scad,
+            "true_weights": w_ref,
+        }
+
 
     # === FINAL AGGREGATED STATISTICS (mean and std)
-    df_stats = pd.DataFrame(all_stats)
+    df_stats = pd.DataFrame([
+        {
+            "time_mco": stat["time_mco"],
+            "time_spoq": stat["time_spoq"],
+            "time_lasso": stat["time_lasso"],
+            "time_scad": stat["time_scad"],
+            "iters_spoq": stat["iters_spoq"],
+            "iters_lasso": stat["iters_lasso"],
+            "iters_scad": stat["iters_scad"],
+        }
+        for stat in all_stats.values()
+    ])
     summary = df_stats.agg(["mean", "std"]).T
     summary.columns = ["Mean", "Std Dev"]
 
@@ -217,9 +236,28 @@ def compare_methods(file, target_name, lambda_range=np.logspace(-1, 7), n_runs=1
     print("\n Summary of results:\n")
     print(summary.round(6))
 
-    if len(loop_range) == 1 : 
-        if plot :
-            plot_comparison(loss_spoq,loss_lasso,loss_scad, **all_stats)[0]
+    if len(loop_range) == 1:
+        if plot:
+            stats = list(all_stats.values())[0]  
+            time_mco = (stats["time_mco"], 0)  
+
+            plot_comparison(
+                loss_spoq=stats["loss_spoq"],
+                loss_lasso=stats["loss_lasso"],
+                loss_scad=stats["loss_scad"],
+                time_spoq=(stats["time_spoq"], 0),
+                time_lasso=(stats["time_lasso"], 0),
+                time_scad=(stats["time_scad"], 0),
+                time_mco=(stats["time_mco"], 0),
+                iters_spoq=(stats["iters_spoq"], 0),
+                iters_lasso=(stats["iters_lasso"], 0),
+                iters_scad=(stats["iters_scad"], 0),
+                weights_spoq=stats["weights_spoq"],
+                weights_lasso=stats["weights_lasso"],
+                weights_scad=stats["weights_scad"],
+                true_weights=stats["true_weights"]
+            )
+
 
     # === SAVE TO CSV IF REQUESTED
     if save_results:
