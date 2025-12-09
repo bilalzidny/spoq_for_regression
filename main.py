@@ -111,8 +111,9 @@ def run_spoq_reg(file, target_name=None, train_size=0.8, test_size=0.2,
     else:
         print("\nSPOQ_reg trained on full dataset.")
 
-    print(f"Absolute Sparsity       : {abs_sparsity:.2f}% non-zeros")
-    print(f"Relative Sparsity       : {rel_sparsity:.2f}% non-zero coefficients\n")
+    print(f"Absolute Sparsity       : {abs_sparsity:.2f}% null coefficient ")
+    print(f"Relative Sparsity       : {rel_sparsity:.2f}% relatively null coefficients\n")
+    print(f"Active coefficients     : {100 - abs_sparsity:.2f}% (non-zero)")
 
     # === Save weights ===
     if save_weights:
