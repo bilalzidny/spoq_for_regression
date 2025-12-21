@@ -8,6 +8,7 @@ import time
 from tqdm   import tqdm
 import itertools
 import optuna
+from scipy.linalg import cho_factor, cho_solve
 
 
 from utils.functions import *
@@ -126,9 +127,9 @@ def standardize_except_bias(X):
 def check_rank(X, verbose = True):
     if np.linalg.matrix_rank(X) == X.shape[1]:
         if verbose:
-            print("The data matrix X is full rank")
+            print("The data matrix X is of full column rank")
     else : 
-        print("The data matrix X is not full rank")
+        print("The data matrix X is not of full column rank")
     
     return X
 
@@ -181,7 +182,9 @@ def mm_algorithm_spoqreg(w_0, B, theta, epsilon, lambda_pen, max_iter, X_train, 
     weights = [w]
     
     X_t_X = X_train.T @ X_train
-    # spec_norm = np.linalg.norm(X_t_X, ord=2)
+    X_t_y = X_train.T @ y_train
+
+    spec_norm = np.linalg.norm(X_t_X, ord=2)
 
     for k in range(max_iter):
 
@@ -201,8 +204,12 @@ def mm_algorithm_spoqreg(w_0, B, theta, epsilon, lambda_pen, max_iter, X_train, 
         mse_val.append(current_mse_val)
 
         # we compute the gradient of the function
-        grad = grad_F(w,X_train,y_train,lambda_pen)
-        gradients_norms.append(np.linalg.norm(grad,2))
+        grad_data = X_t_X @ w - X_t_y
+        grad_pen = lambda_pen * grad_Psi(w) 
+        grad = grad_data + grad_pen
+        
+        grad_norm = np.linalg.norm(grad, 2)
+        gradients_norms.append(grad_norm)
 
         # check stopping criterion on gradient norm
         if len(train_loss) > 2 and abs(current_train_loss - train_loss[-2]) <= epsilon:   # condition à faire évoluer (diviser par une valeur de la fonction max?)
@@ -220,14 +227,20 @@ def mm_algorithm_spoqreg(w_0, B, theta, epsilon, lambda_pen, max_iter, X_train, 
                 rho = 0
             A = lambda_pen * A_tr(w,rho) +  X_t_X
 
-            z = w - np.linalg.solve(A, grad)
+            try:
+                # La matrice A est Symétrique Définie Positive
+                c, lower = cho_factor(A, lower=True)
+                step = cho_solve((c, lower), grad)
+                z = w - step
+            except np.linalg.LinAlgError:
+                # Fallback si Cholesky échoue (rare si lambda > 0)
+                z = w - np.linalg.solve(A, grad)
             
             # we check if z belongs to the lq-ball complement
             if is_in_l_q_ball(z,rho):
                 rho = theta * rho
             else : 
                 break
-
         # when z belongs to the lq-ball complement we update the weights
         w = z
         
@@ -578,6 +591,363 @@ def fista_scad(w_0, epsilon, lambda_pen, max_iter, X_train, y_train, X_val, y_va
         print(f"Final Loss : {train_loss[-1]}")
 
     return w, train_loss, mse_val, mse_train, absolute_sparsities, relative_sparsities, gradients_norms, k, weights
+
+def fista_mcp(w_0, epsilon, lambda_pen, max_iter, X_train, y_train, X_val, y_val, verbose=True):
+    """
+    Fast Iterative Shrinkage-Thresholding Algorithm (FISTA) for solving the MCP problem:
+        min_w Phi(w) + lambda * MCP(w)
+
+    Aligned with fista_scad structure for fair comparison.
+    """
+    # Precompute Lipschitz constant: L = σ_max(XᵀX)
+    L = np.linalg.norm(X_train.T @ X_train, ord=2)  
+
+    start_time = time.perf_counter()
+    w = w_0.copy()              
+    z = w.copy()              
+    t = 1.0      
+    max_weight = np.max(np.abs(w[1:])) if np.max(np.abs(w[1:])) > 0 else 1.0
+    
+    # MCP parameter (usually 3.7 to mimic SCAD behavior, or > 1)
+    gamma_mcp = 3.7 
+
+    # History initialization (Strictly following fista_scad format)
+    train_loss = []
+    mse_val = []
+    mse_train = []
+    
+    # Sparsity initialization
+    rel_sp_init = 100 * np.sum((np.abs(w[1:]) <= relative_sparsity_ratio * max_weight)) / np.size(w[1:])
+    abs_sp_init = 100 * np.sum((np.abs(w[1:]) <= tolerance_absoulte_sparsity)) / np.size(w[1:])
+    
+    relative_sparsities = [rel_sp_init]
+    absolute_sparsities = [abs_sp_init]
+    gradients_norms = []
+    weights = [w]
+
+    for k in range(1, max_iter + 1):
+
+        # 1. Compute loss (MCP specific)
+        current_train_loss = mcp_loss(w, X_train, y_train, lambda_pen, gamma=gamma_mcp)
+        train_loss.append(current_train_loss)
+
+        # 2. Compute Train MSE
+        y_pred_train = X_train @ w
+        y_pred_train = y_pred_train.reshape(-1)
+        current_mse_train = mean_squared_error(y_pred_train, y_train)
+        mse_train.append(current_mse_train)
+        
+        if verbose and k % 10 == 0:
+            print(f"Iteration {k}, Loss = {current_train_loss}")
+
+        # 3. Compute Validation MSE
+        y_pred = X_val @ w
+        current_mse_val = mean_squared_error(y_pred, y_val)
+        mse_val.append(current_mse_val)
+        
+        # 4. Gradient computation (at point z) & Norm tracking (at point w)
+        grad = grad_Phi(z, X_train, y_train)
+        grad_w = grad_Phi(w, X_train, y_train)
+        gradients_norms.append(np.linalg.norm(grad_w, 2))
+
+        # 5. FISTA Update (Proximal MCP)
+        # w_{k} = prox(z_k - 1/L * grad(z_k))
+        w_next = mcp_prox(z - (1/L) * grad, lambda_pen / L, gamma=gamma_mcp)
+
+        # 6. STOPPING CRITERION (Missing in previous version)
+        # Check convergence on function value
+        loss_next = mcp_loss(w_next, X_train, y_train, lambda_pen, gamma=gamma_mcp)
+        
+        if abs(current_train_loss - loss_next) < epsilon:
+            if verbose: 
+                print(f"Stopping criteria on function update reached at iter {k}/{max_iter}")
+            # We still accept this step
+            w = w_next
+            weights.append(w)
+            # Update sparsities one last time for consistency
+            max_weight = np.max(np.abs(w[1:])) if np.max(np.abs(w[1:])) > 0 else 1.0
+            rel_sp = 100 * np.sum((np.abs(w[1:]) <= relative_sparsity_ratio * max_weight)) / np.size(w[1:])
+            abs_sp = 100 * np.sum((np.abs(w[1:]) <= tolerance_absoulte_sparsity)) / np.size(w[1:])
+            relative_sparsities.append(rel_sp)
+            absolute_sparsities.append(abs_sp)
+            break
+
+        # 7. Momentum update
+        t_next = 0.5 * (1 + np.sqrt(1 + 4 * t**2))
+        z = w_next + ((t - 1) / t_next) * (w_next - w)
+        
+        # Update variables
+        w = w_next
+        t = t_next
+        weights.append(w)
+
+        # 8. Sparsity Metrics
+        max_weight = np.max(np.abs(w[1:])) if np.max(np.abs(w[1:])) > 0 else 1.0
+        
+        # Relative Sparsity
+        current_relative_sparsity = 100 * np.sum((np.abs(w[1:]) <= relative_sparsity_ratio * max_weight)) / np.size(w[1:])
+        relative_sparsities.append(current_relative_sparsity)
+
+        # Absolute Sparsity
+        current_absolute_sparsity = 100 * np.sum((np.abs(w[1:]) <= tolerance_absoulte_sparsity )) / np.size(w[1:])
+        absolute_sparsities.append(current_absolute_sparsity)
+
+    end_time = time.perf_counter()
+    execution_time = end_time - start_time 
+
+    if verbose:   
+        print(f"Temps d'exécution : {execution_time:.6f} secondes")
+        print(f"\nMaximum number of iterations reached {k}" if k==max_iter else "")
+        print(f"Final Loss : {train_loss[-1]}")
+
+    return w, train_loss, mse_val, mse_train, absolute_sparsities, relative_sparsities, gradients_norms, k, weights
+
+
+def reweighted_l1(w_0, epsilon, lambda_pen, max_iter, X_train, y_train, X_val, y_val, verbose=True):
+    """
+    Reweighted L1 Minimization (Candes, Wakin, Boyd, 2008).
+    
+    This algorithm solves the non-convex regularization problem:
+        min_w  Phi(w) + lambda * sum(log(|w| + eps))
+    
+    It uses a Majorization-Minimization (MM) strategy:
+    1. Majorization: Approximate the log-sum penalty by a weighted L1 penalty.
+    2. Minimization: Solve the resulting convex Weighted Lasso problem using FISTA.
+    
+    Consistency: Uses Phi (SSE/2) everywhere to match gradient scale with other algorithms.
+    """
+    start_time = time.perf_counter()
+    
+    # --- Parameters ---
+    n_reweighting_iters = 15     # Maximum number of outer MM iterations
+    epsilon_stab = 1e-6          # Stability parameter for the log approximation
+    
+    # Tolerances for stopping criteria
+    tol_inner = epsilon          # Stop FISTA (inner) if weighted lasso cost stabilizes
+    tol_outer = epsilon          # Stop Reweighting (outer) if global log-sum cost stabilizes
+    
+    # Initialization
+    w = w_0.copy()
+    weights_vec = np.ones_like(w) # Initial weights = 1 (Standard Lasso)
+    
+    # Precompute Lipschitz constant for FISTA step size
+    L = np.linalg.norm(X_train.T @ X_train, ord=2) 
+    
+    # --- History & Metrics ---
+    train_loss = []
+    mse_val = []
+    mse_train = [] 
+    absolute_sparsities = []
+    relative_sparsities = []
+    gradients_norms = []
+    weights_hist = [w.copy()]
+    
+    total_iter = 0
+    
+    # --- OBJECTIVE FUNCTIONS ---
+    
+    # 1. Global Objective (The non-convex problem we actually want to solve)
+    # F(w) = Phi(w) + lambda * sum(log(|w| + eps))
+    def global_log_sum_objective(w_curr):
+        return Phi(w_curr, X_train, y_train) + lambda_pen * np.sum(np.log(np.abs(w_curr) + epsilon_stab))
+
+    # 2. Surrogate Objective (The convex sub-problem for FISTA)
+    # G(w) = Phi(w) + lambda * sum(weights * |w|)
+    def weighted_lasso_objective(w_curr, weights):
+        return Phi(w_curr, X_train, y_train) + lambda_pen * np.sum(weights * np.abs(w_curr))
+
+    prev_global_loss = global_log_sum_objective(w)
+
+    # ==========================================
+    # === OUTER LOOP (Reweighting Steps) ===
+    # ==========================================
+    for rw_iter in range(n_reweighting_iters):
+        
+        # --- INNER LOOP (FISTA: Solving Weighted Lasso) ---
+        z = w.copy()
+        t = 1.0
+        prev_inner_loss = weighted_lasso_objective(w, weights_vec)
+        
+        # Budget per inner cycle (heuristic to avoid over-spending time on early weights)
+        inner_max_iter = max_iter // 5 
+        
+        for k in range(inner_max_iter):
+            total_iter += 1
+            
+            # 1. Gradient Descent Step
+            # Grad = X^T (Xz - y)
+            grad = grad_Phi(z, X_train, y_train) 
+            
+            # 2. Weighted Proximal Operator (Shrinkage)
+            # Thresholds are element-wise: (lambda * weight_i) / L
+            thresholds = (lambda_pen * weights_vec) / L
+            w_next = soft_thresholding_weighted(z - (1/L) * grad, thresholds)
+            
+            # 3. Nesterov Momentum
+            t_next = 0.5 * (1 + np.sqrt(1 + 4 * t**2))
+            z = w_next + ((t - 1) / t_next) * (w_next - w)
+            w = w_next
+            t = t_next
+            
+            # --- Inner Stopping Criterion ---
+            # Stop if the convex sub-problem is solved (Weighted Lasso cost stabilizes)
+            curr_inner_loss = weighted_lasso_objective(w, weights_vec)
+            if abs(curr_inner_loss - prev_inner_loss) < tol_inner:
+                break
+            prev_inner_loss = curr_inner_loss
+
+        # --- END OF INNER LOOP ---
+
+        # --- Metrics & Logging ---
+        # We track the GLOBAL log-sum loss (it must decrease monotonically)
+        curr_global_loss = global_log_sum_objective(w)
+        train_loss.append(curr_global_loss)
+        
+        # Standard MSE for reporting
+        y_pred_train = X_train @ w
+        mse_train.append(mean_squared_error(y_train, y_pred_train))
+        
+        y_pred_val = X_val @ w
+        mse_val.append(mean_squared_error(y_val, y_pred_val))
+        
+        weights_hist.append(w.copy())
+        gradients_norms.append(np.linalg.norm(grad)) # Log last inner gradient
+
+        # Sparsity
+        if len(w) > 1:
+            max_w = np.max(np.abs(w[1:])) if np.max(np.abs(w[1:])) > 0 else 1.0
+            abs_sp = 100 * np.sum((np.abs(w[1:]) <= tolerance_absoulte_sparsity )) / np.size(w[1:])
+            rel_sp = 100 * np.sum((np.abs(w[1:]) <= relative_sparsity_ratio * max_w)) / np.size(w[1:])
+        else:
+            abs_sp, rel_sp = 0, 0
+        absolute_sparsities.append(abs_sp)
+        relative_sparsities.append(rel_sp)
+        
+        if verbose:
+            print(f"Reweighting Iter {rw_iter+1}: Loss={curr_global_loss:.5f}")
+
+        # --- Outer Stopping Criterion ---
+        # Stop if the Global Objective (Log-Sum) stabilizes.
+        if abs(curr_global_loss - prev_global_loss) < tol_outer:
+            if verbose: print(f"Converged at outer iter {rw_iter+1}")
+            break
+        prev_global_loss = curr_global_loss
+
+        # --- WEIGHT UPDATE (Majorization Step) ---
+        # w_i = 1 / (|w_i| + epsilon)
+        weights_vec = 1.0 / (np.abs(w) + epsilon_stab)
+
+    end_time = time.perf_counter()
+    if verbose: print(f"Execution time: {end_time - start_time:.4f}s")
+    
+    return w, train_loss, mse_val, mse_train, absolute_sparsities, relative_sparsities, gradients_norms, total_iter, weights_hist
+
+
+
+
+def irls_lp(w_0, epsilon, lambda_pen, max_iter, X_train, y_train, X_val, y_val, p=0.5, verbose=True):
+    """
+    Iteratively Reweighted Least Squares (IRLS) for Lp minimization (0 < p < 1).
+    
+    This algorithm solves the non-convex regularization problem:
+        min_w  Phi(w) + lambda * ||w||_p^p
+    
+    where Phi(w) is the data fidelity term (SSE/2).
+    
+    Reference: Chartrand & Yin (2008), "Iteratively reweighted algorithms for compressive sensing."
+    """
+    start_time = time.perf_counter()
+    w = w_0.copy()
+    
+    # Stability parameter to avoid division by zero when weights are close to 0
+    epsilon_stab = 1e-6 
+    n_samples, n_features = X_train.shape
+    
+    # --- 1. PRE-COMPUTATION (Optimization) ---
+    # We precompute X^T X and X^T y outside the loop because they are constant.
+    # This reduces the per-iteration complexity significantly.
+    XTX = X_train.T @ X_train
+    b = X_train.T @ y_train
+    
+    # --- HISTORY INITIALIZATION ---
+    train_loss = []
+    mse_val = []
+    mse_train = []
+    absolute_sparsities = []
+    relative_sparsities = []
+    gradients_norms = []
+    weights_hist = [w.copy()]
+    
+    # Define the Objective Function (Loss)
+    # F(w) = Data Fidelity + Lp Penalty
+    def compute_loss(w_curr):
+        return Phi(w_curr, X_train, y_train) + lambda_pen * np.sum(np.power(np.abs(w_curr) + epsilon_stab, p))
+
+    prev_loss = compute_loss(w)
+
+    for k in range(max_iter):
+        
+        # --- 2. WEIGHT UPDATE (Majorization Step) ---
+        # We compute the diagonal weights W based on the previous iteration.
+        # Mathematical derivation: W_ii = p * (|w_i| + eps)^(p-2)
+        weights_diag = p * np.power(np.abs(w) + epsilon_stab, p - 2)
+        
+        # --- 3. LINEAR SYSTEM UPDATE (Minimization Step) ---
+        # We solve the reweighted system: (X^T X + lambda * W) w = X^T y
+        
+        # We copy XTX and update only the diagonal elements with the new weights
+        A = XTX.copy()
+        np.fill_diagonal(A, A.diagonal() + lambda_pen * weights_diag)
+        
+        try:
+            # Solve the linear system
+            w_next = np.linalg.solve(A, b)
+        except np.linalg.LinAlgError:
+            if verbose: print("Singular matrix encountered in IRLS, stopping.")
+            break
+            
+        w = w_next
+        
+        # --- 4. METRICS & LOGGING ---
+        curr_loss = compute_loss(w)
+        train_loss.append(curr_loss)
+        
+        # Compute MSE for monitoring (Train & Validation)
+        y_pred_train = X_train @ w
+        mse_train.append(mean_squared_error(y_train, y_pred_train))
+        
+        y_pred_val = X_val @ w
+        mse_val.append(mean_squared_error(y_val, y_pred_val))
+        
+        # Compute Sparsity (Absolute & Relative)
+        if len(w) > 1:
+            max_w = np.max(np.abs(w[1:])) if np.max(np.abs(w[1:])) > 0 else 1.0
+            # Hard threshold for statistics
+            abs_sp = 100 * np.sum((np.abs(w[1:]) <= tolerance_absoulte_sparsity )) / np.size(w[1:])
+            # Relative threshold based on the max weight
+            rel_sp = 100 * np.sum((np.abs(w[1:]) <= relative_sparsity_ratio * max_w)) / np.size(w[1:])
+        else:
+            abs_sp, rel_sp = 0, 0
+            
+        absolute_sparsities.append(abs_sp)
+        relative_sparsities.append(rel_sp)
+        
+        # Store history
+        weights_hist.append(w.copy())
+        gradients_norms.append(0) # IRLS does not compute explicit gradients, placeholder
+        
+        # --- 5. STOPPING CRITERION ---
+        # Stop if the Objective Function (Loss) stabilizes.
+        if abs(curr_loss - prev_loss) < epsilon:
+            if verbose: print(f"IRLS converged at iter {k}")
+            break
+        
+        prev_loss = curr_loss
+
+    end_time = time.perf_counter()
+    if verbose: print(f"Execution time: {end_time - start_time:.4f}s")
+    
+    return w, train_loss, mse_val, mse_train, absolute_sparsities, relative_sparsities, gradients_norms, k, weights_hist
 
 
 def MCO(X,y):
