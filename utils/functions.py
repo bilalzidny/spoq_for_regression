@@ -14,8 +14,8 @@ import time
 alpha = 7e-7
 beta = 1e-3
 eta = 1e-1
-p = 0.5
-q = 2
+p = 0.25
+q = 5
  
 
 def ComputeLipschitz(N):    
@@ -177,12 +177,11 @@ def Psi_np(w):
     fcost = np.log(((lp**p + beta**p)**(1/p)) / lq)
     return fcost
 
-def Phi(w,X,y):
-    n = X.shape[0]
-    return 0.5*np.linalg.norm(y - X @ w,ord=2)
+def Phi(w, X, y):
+    residus = y - X @ w
+    return 0.5 * (residus.T @ residus)
 
 def grad_Phi(w,X,y):
-    n = X.shape[0]
     X_t = np.transpose(X)
     return X_t @ X @ w - X_t @ y
 
@@ -364,3 +363,59 @@ def prox_SCAD(x, gamma, a, lamb):
         p[~idx] = p2[~idx]
 
     return p
+
+
+def soft_thresholding_weighted(z, weights):
+    """
+    Soft thresholding with element-wise weights (vector).
+    z: input vector
+    weights: vector of thresholds (lambda * w_i)
+    """
+    return np.sign(z) * np.maximum(np.abs(z) - weights, 0)
+
+def mcp_prox(z, lambda_pen, gamma=3.7):
+    """
+    Proximal operator for MCP (Minimax Concave Penalty).
+    """
+    abs_z = np.abs(z)
+    
+    # Region 1: |z| <= gamma * lambda
+    condition_1 = abs_z <= gamma * lambda_pen
+    res = np.zeros_like(z)
+    
+    term1 = (np.sign(z) * (abs_z - lambda_pen) / (1 - 1/gamma))
+    res[condition_1] = term1[condition_1]
+    
+    # Region 2: |z| > gamma * lambda (Identity)
+    res[~condition_1] = z[~condition_1]
+    
+    # Correction for small values strictly zeroed out by standard soft thresh part implicit in formula
+    # More simply, MCP prox acts like soft thresh if |z| is small, but boosts large values back.
+    # Standard formula implementation:
+    # if |z| <= lambda: 0
+    # if lambda < |z| <= gamma*lambda: sign(z)(|z|-lambda)/(1-1/gamma)
+    # if |z| > gamma*lambda: z
+    
+    final_res = np.zeros_like(z)
+    
+    mask_zero = abs_z <= lambda_pen
+    mask_linear = (abs_z > lambda_pen) & (abs_z <= gamma * lambda_pen)
+    mask_identity = abs_z > gamma * lambda_pen
+    
+    final_res[mask_zero] = 0
+    final_res[mask_linear] = (np.sign(z)[mask_linear] * (abs_z[mask_linear] - lambda_pen)) / (1 - 1/gamma)
+    final_res[mask_identity] = z[mask_identity]
+    
+    return final_res
+
+def mcp_loss(w, X, y, lambda_pen, gamma=3.7):
+    """Calcule la loss MSE + Penalité MCP"""
+    mse = Phi(w, X, y) 
+    abs_w = np.abs(w)
+    pen = np.zeros_like(w)
+    
+    mask1 = abs_w <= gamma * lambda_pen
+    pen[mask1] = lambda_pen * abs_w[mask1] - (abs_w[mask1]**2)/(2*gamma)
+    pen[~mask1] = 0.5 * gamma * (lambda_pen**2)
+    
+    return mse + np.sum(pen)

@@ -1,179 +1,247 @@
+import os
+import logging
 import numpy as np
 import argparse
+import json
 from tqdm import tqdm
-import os
-import matplotlib.pyplot as plt, matplotlib.image as mpimg
-import logging
+from joblib import Parallel, delayed
 from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+from datetime import datetime  # <--- AJOUT ICI
 
 from utils.logger import save_results
 from utils.algorithms import load_and_preprocess
-from utils.metrics import jaccard_similarity, hamming_distance, euclidian_distance
-from utils.plots import plot_train_size_curves_advanced
 from run_results import run_results_optuna
 from run_on_custom import run_on_custom
 from create_dataset import create_dataset
 
+# === UTILS JSON ===
+class NumpyEncoder(json.JSONEncoder):
+    """ Permet de sauvegarder les types Numpy (float32, ndarray) dans un JSON standard """
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super(NumpyEncoder, self).default(obj)
+
 # === SETUP LOGGING ===
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
-    filename="logs/experiment.log",
+    filename="logs/experiment_train_size.log",
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-def evaluate_train_size_impact(file, target_name, train_sizes, random_state=42, n_runs=10, **base_kwargs):
+# === FONCTION WORKER ===
+def _run_single_train_size_experiment(ts_idx, ts_val, run_idx, random_state, 
+                                      X_train_full, y_train_full, X_test, y_test, 
+                                      w_ref, is_custom, base_kwargs):
     """
-    Evaluate the effect of training set size on performance for a given dataset. 
-    Test on 20% of the dataset and averaged over 10 runs.
-
-    Parameters:
-        file (str): Path to the dataset CSV file in data folder.
-        target_name (str): Name of the target column in the dataset.
-        train_sizes (list of float): Proportions of training data to use.
-        random_state (int): Seed for reproducibility.
-        n_runs (int): Number of repetitions per training size.
-        force (bool): Whether to force rerun even if output figure already exists.
-        **base_kwargs: Additional parameters for dataset creation (if custom).
-    
-    Saves:
-        - Results in 'results/' directory
-        - Plot in 'plots/[dataset_name]/' directory
+    Exécute une simulation pour une taille d'entraînement donnée.
     """
-    
-    output_path = f"plots/{file.split('.')[0]}/mse_sparsity_vs_train_size.png"
-    is_custom = "custom_dataset" in file.lower()
+    seed = random_state + run_idx
+    rng = np.random.RandomState(seed)
 
-    # Check if the figure already exists
-    if os.path.exists(output_path):
-        answer = input(f"The figure '{output_path}' already exists. Re-run? (y/n): ").strip().lower()
-        if answer not in ["y", "yes"]:
-            show = input("Show existing figure? (y/n): ").strip().lower()
-            if show in ["y", "yes"]:
-                img = mpimg.imread(output_path)
-                plt.figure(figsize=(18, 8))
-                plt.imshow(img)
-                plt.axis('off')
-                plt.show()
-            return
+    # 1. Sous-échantillonnage
+    n_samples_train = int(ts_val * len(X_train_full))
+    if n_samples_train < 5: n_samples_train = 5
 
-    logging.info("STARTED TRAIN SIZE IMPACT EXPERIMENT")
+    sel_indices = rng.choice(len(X_train_full), size=n_samples_train, replace=False)
+    Xt = X_train_full[sel_indices]
+    yt = y_train_full[sel_indices]
 
-    methods = ["mco", "lasso", "spoq", "scad"]
-
-    # Initialize results dictionary with base and new metrics
-    results = {
-        "train_size": train_sizes,
-        "relative_mse_test": {m: [[] for _ in train_sizes] for m in methods},
-        "relative_mse_train": {m: [[] for _ in train_sizes] for m in methods},
-        "mae_test": {m: [[] for _ in train_sizes] for m in methods},
-        "mae_train": {m: [[] for _ in train_sizes] for m in methods},
-        "mape_test": {m: [[] for _ in train_sizes] for m in methods},
-        "mape_train": {m: [[] for _ in train_sizes] for m in methods},
-        "absolute_sparsity": {m: [[] for _ in train_sizes] for m in methods},
-        "relative_sparsity": {m: [[] for _ in train_sizes] for m in methods},
-        "lambda_pen_lasso": [[] for _ in train_sizes],
-        "lambda_pen_spoq": [[] for _ in train_sizes],
-        "lambda_pen_scad": [[] for _ in train_sizes],
-    }
-
-    # === CREATE THE DATASET ======
-    if is_custom: 
-        _, w_ref = create_dataset(save=True, noise_design="median", **base_kwargs)
-
-    # Add custom dataset-specific metrics
+    # 2. Benchmark
     if is_custom:
-        for metric in ["jaccard", "hamming", "euclidean", "confusion_matrix"]:
-            results[metric] = {m: [[] for _ in train_sizes] for m in methods}
+        result = run_on_custom(
+            plot=False,
+            log_results=False, 
+            tuning="optuna",
+            w_ref=w_ref,
+            X_train=Xt, y_train=yt, 
+            X_test=X_test, y_test=y_test,
+            lambda_range=np.logspace(-1, 7, 50),
+            n_trials=100, 
+            verbose=False,
+            **base_kwargs
+        )
+    else:
+        result = run_results_optuna(
+            file=None,
+            target_name=None,
+            train_size=None, test_size=None,
+            random_state=seed,
+            log_results=False, 
+            return_results=True, 
+            verbose=False,
+            X_train=Xt, y_train=yt, 
+            X_test=X_test, y_test=y_test,
+            n_trials=100
+        )
 
-    # Load and split dataset
-    X, y = load_and_preprocess(file, target_name=target_name, verbose=False)
+    return ts_idx, result
+
+
+# === FONCTION PRINCIPALE AVEC SAUVEGARDE TEMPS RÉEL ===
+def evaluate_train_size_impact_parallel(file, target_name, train_sizes, random_state=42, n_runs=10, n_jobs=-1, **base_kwargs):
+    
+    # --- MODIFICATION ICI : AJOUT DU TIMESTAMP ---
+    # Format: YYYYMMDD_HHMMSS (ex: 20231027_143000)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # On nettoie le nom du fichier pour enlever l'extension .csv si présente
+    clean_filename = str(file).split(os.sep)[-1].split('.')[0]
+    
+    file_prefix = f"train_size_{clean_filename}_parallel_{timestamp}"
+    json_path = os.path.join("results", f"{file_prefix}_partial.json")
+    os.makedirs("results", exist_ok=True)
+    
+    is_custom = "custom_dataset" in str(file).lower()
+
+    logging.info(f"STARTED TRAIN SIZE IMPACT EXPERIMENT (ID: {timestamp})")
+    print(f"Starting parallel execution with n_jobs={n_jobs}...")
+    print(f"Partial results will be saved to: {json_path}")
+
+    methods = ["mco", "lasso", "spoq", "scad", "reweighted", "mcp", "irls"]
+
+    # --- 1. DATASET SETUP ---
+    print("Generating/Loading full dataset...")
+    w_ref = None
+    if is_custom:
+        df, w_ref = create_dataset(save=False, **base_kwargs)
+        y = df["target"].to_numpy()
+        X = df.drop(columns=["target"]).to_numpy()
+    else:
+        X, y = load_and_preprocess(file, target_name=target_name, verbose=False)
+        if os.path.exists("data/weights.npy"):
+            w_ref = np.load("data/weights.npy")
+
     X_train_full, X_test, y_train_full, y_test = train_test_split(
         X, y, train_size=0.8, test_size=0.2, random_state=random_state
     )
 
-    # Load true weights if using custom dataset
+    # --- 2. INITIALISATION STRUCTURE RÉSULTATS ---
+    results = {
+        "train_size": train_sizes,
+        "meta": base_kwargs,
+        "timestamp": timestamp, # On stocke aussi le timestamp dans le JSON
+        "relative_mse_test": {m: [[] for _ in train_sizes] for m in methods},
+        "relative_mse_train": {m: [[] for _ in train_sizes] for m in methods},
+        "mae_test": {m: [[] for _ in train_sizes] for m in methods},
+        "absolute_sparsity": {m: [[] for _ in train_sizes] for m in methods},
+        "relative_sparsity": {m: [[] for _ in train_sizes] for m in methods},
+        
+        "lambda_pen_lasso": [[] for _ in train_sizes],
+        "lambda_pen_spoq": [[] for _ in train_sizes],
+        "lambda_pen_scad": [[] for _ in train_sizes],
+        "lambda_pen_reweighted": [[] for _ in train_sizes],
+        "lambda_pen_mcp": [[] for _ in train_sizes],
+        "lambda_pen_irls": [[] for _ in train_sizes],
+    }
+
     if is_custom:
-        w_ref = np.load("data/weights.npy")
+        for metric in ["jaccard", "hamming", "euclidean", "confusion_matrix"]:
+            results[metric] = {m: [[] for _ in train_sizes] for m in methods}
 
-    # Loop over each train size
-    for idx, ts in enumerate(tqdm(train_sizes, desc="Train sizes")):
+    # --- 3. PRÉPARATION TÂCHES ---
+    tasks = []
+    for i, ts in enumerate(train_sizes):
         for run in range(n_runs):
-            seed = random_state + run
-            rng = np.random.RandomState(seed)
+            tasks.append((i, ts, run))
 
-            n = int(ts * len(X_train_full))
-            sel = rng.choice(len(X_train_full), size=n, replace=False)
-            Xt, yt = X_train_full[sel], y_train_full[sel]
+    total_tasks = len(tasks)
 
-            # Run appropriate evaluation depending on dataset type
-            if is_custom:
-                res = run_on_custom(
-                    plot=False, log_results=True, train_size=ts, test_size=0.2,
-                    X_train=Xt, y_train=yt, X_test=X_test, y_test=y_test,
-                    lambda_range=np.logspace(-1, 7, 50), w_ref=w_ref, tuning="optuna", n_trials=200, **base_kwargs
+    # --- 4. EXÉCUTION AVEC SAUVEGARDE TEMPS RÉEL ---
+    try:
+        with Parallel(n_jobs=n_jobs, return_as="generator") as parallel:
+            
+            results_generator = parallel(
+                delayed(_run_single_train_size_experiment)(
+                    i, ts, run, random_state, 
+                    X_train_full, y_train_full, X_test, y_test, 
+                    w_ref, is_custom, base_kwargs
                 )
-            else:
-                res = run_results_optuna(
-                    file=file, target_name=target_name, train_size=ts, test_size=0.2,
-                    random_state=seed, log_results=True, return_results=True, verbose=False,
-                    X_train=Xt, y_train=yt, X_test=X_test, y_test=y_test
-                )
+                for i, ts, run in tasks
+            )
 
-            # Store metrics per method
-            for m in methods:
-                results["relative_mse_test"][m][idx].append(res["metrics"]["test"]["relative_error"][m])
-                results["relative_mse_train"][m][idx].append(res["metrics"]["train"]["relative_error"][m])
-                results["mae_test"][m][idx].append(res["metrics"]["test"]["mae"][m])
-                results["mae_train"][m][idx].append(res["metrics"]["train"]["mae"][m])
-                results["mape_test"][m][idx].append(res["metrics"]["test"]["mape"][m])
-                results["mape_train"][m][idx].append(res["metrics"]["train"]["mape"][m])
-                results["absolute_sparsity"][m][idx].append(res["sparsity"]["absolute"][m])
-                results["relative_sparsity"][m][idx].append(res["sparsity"]["relative"][m])
+            # Compteur pour sauvegarde périodique (toutes les 5 tâches)
+            save_counter = 0
 
-                if is_custom:
-                    results["jaccard"][m][idx].append(res["similarities"]["jaccard"][m])
-                    results["hamming"][m][idx].append(res["similarities"]["hamming"][m])
-                    results["euclidean"][m][idx].append(res["similarities"]["relative euclidean distance to ref"][m])
-                    results["confusion_matrix"][m][idx].append(res["confusion_matrices"][m])
+            for idx, res in tqdm(results_generator, total=total_tasks, desc="Computing & Saving"):
+                
+                # --- AGREGATION ---
+                for m in methods:
+                    results["relative_mse_test"][m][idx].append(res["metrics"]["test"]["relative_error"][m])
+                    results["relative_mse_train"][m][idx].append(res["metrics"]["train"]["relative_error"][m])
+                    results["mae_test"][m][idx].append(res["metrics"]["test"]["mae"][m])
+                    results["absolute_sparsity"][m][idx].append(res["sparsity"]["absolute"][m])
+                    results["relative_sparsity"][m][idx].append(res["sparsity"]["relative"][m])
 
-            # Store optimized lambdas
-            results["lambda_pen_lasso"][idx].append(res["params"]["fista"]["lambda_pen"])
-            results["lambda_pen_spoq"][idx].append(res["params"]["trust_region"]["lambda_pen"])
-            results["lambda_pen_scad"][idx].append(res["params"]["scad"]["lambda_pen"])
+                    if is_custom:
+                        results["jaccard"][m][idx].append(res["similarities"]["jaccard"][m])
+                        results["hamming"][m][idx].append(res["similarities"]["hamming"][m])
+                        results["euclidean"][m][idx].append(res["similarities"]["relative euclidean distance to ref"][m])
+                        results["confusion_matrix"][m][idx].append(res["confusion_matrices"][m])
 
-    # Save results and generate plots
-    save_results(results, output_dir="results", file_prefix=f"train_size_{file.split('.')[0]}")
-    plot_train_size_curves_advanced(results, output_path, save_plot=True)
-    print("Done – results saved and plot generated.")
+                results["lambda_pen_lasso"][idx].append(res["params"]["fista"].get("lambda_pen"))
+                results["lambda_pen_spoq"][idx].append(res["params"]["trust_region"].get("lambda_pen"))
+                results["lambda_pen_scad"][idx].append(res["params"]["scad"].get("lambda_pen"))
+                results["lambda_pen_reweighted"][idx].append(res["params"]["reweighted"].get("lambda_pen"))
+                results["lambda_pen_mcp"][idx].append(res["params"]["mcp"].get("lambda_pen"))
+                results["lambda_pen_irls"][idx].append(res["params"]["irls"].get("lambda_pen"))
+
+                save_counter += 1
+
+                # --- SAUVEGARDE PÉRIODIQUE ---
+                if save_counter % 5 == 0 or save_counter == total_tasks:
+                    with open(json_path, "w") as f:
+                        json.dump(results, f, indent=4, cls=NumpyEncoder)
+
+    except KeyboardInterrupt:
+        print("\nInterruption détectée ! Les résultats partiels sont sauvegardés dans :", json_path)
+        raise
+    except Exception as e:
+        print(f"\nErreur critique : {e}")
+        print("Les résultats partiels sont sauvegardés dans :", json_path)
+        raise
+
+    # --- 5. FINALISATION ---
+    final_json_path = os.path.join("results", f"{file_prefix}_final.json")
+    if os.path.exists(json_path):
+        os.rename(json_path, final_json_path)
+    
+    print(f"Experiment completed. Final results saved to: {final_json_path}")
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--file", type=str, default="custom_dataset.csv")
-    p.add_argument("--target_name", type=str, default="target")
-    args = p.parse_args()
 
-    # base_kwargs = {
-    #     "n_samples": 1000, "n_features": 100, "n_informative": 20,
-    #     "noise": 0.1, "bias":10.0, "coef":True,
-    #     "random_state":42, "effective_rank":None,
-    #     "tail_strength":0.5, "output_path": "data/custom_dataset.csv"
-    # }
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--file", type=str, default="custom_dataset.csv")
+    parser.add_argument("--target_name", type=str, default="target")
+    args = parser.parse_args()
 
     base_kwargs = {
-        "n_samples": 100,
-        "n_features": 50,
-        "n_informative": 10,
-        "bias": 0,
+        "n_samples": 1000,
+        "n_features": 100,
+        "n_informative": 20,
+        "bias": 10,
         "coef": True,
         "random_state": 42,
         "effective_rank": None,
         "tail_strength": 0.5,
+        "noise_design": "median",
+        "noise": 0.1
     }
     
-    train_sizes = np.linspace(0.15, 0.8, 14).tolist()
-    evaluate_train_size_impact(
+    # train_sizes = np.linspace(0.15, 0.8, 14)
+    train_sizes = [0.01, 0.02, 0.05, 0.06, 0.07, 0.08, 0.09,
+                   0.1, 0.125, 0.15, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+    
+    evaluate_train_size_impact_parallel(
         file=args.file, target_name=args.target_name,
-        train_sizes=train_sizes, n_runs=10, **base_kwargs
-    )
+        train_sizes=train_sizes, n_runs=10, n_jobs=-1, **base_kwargs)
